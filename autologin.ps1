@@ -1,72 +1,62 @@
-$logPath = "$env:TEMP\autologin_debug.log"
-function Write-Log {
-    param (
-        [string]$message
-    )
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path $logPath -Value "$timestamp - $message"
+<#
+  Windows autologin without a password (local account).
+    .\autologin.ps1          enable
+    .\autologin.ps1 -Undo    disable autologin again
+  Log: %TEMP%\autologin.log
+#>
+param([switch]$Undo, [switch]$Pause)
+
+# Relaunch as administrator if needed
+$me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Pause"
+    if ($Undo) { $argList += ' -Undo' }
+    Start-Process powershell -Verb RunAs -ArgumentList $argList
+    exit
 }
 
-function Test-Admin {
-    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
+$ErrorActionPreference = 'Stop'
+$log = "$env:TEMP\autologin.log"
+function Say($msg) { Write-Host $msg; Add-Content $log "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg" }
 
-Write-Log "Starting autologin script..."
-
-if (-not (Test-Admin)) {
-    Write-Log "Script was not run with administrative privileges."
-    Write-Log "Please try running the script again with administrative privileges."
-    exit 1
-} else {
-    Write-Log "Script is running with administrative privileges."
-}
+$reg = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 
 try {
-    $currentUser = (Get-WmiObject -Class Win32_ComputerSystem | Select-Object -ExpandProperty UserName).Split('\')[1]
-    Write-Log "Current user: $currentUser"
-
-    $RegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-    Write-Log "Setting registry values for autologin"
-
-    Set-ItemProperty -Path $RegPath -Name "DefaultUserName" -Value $currentUser -Type String
-    Write-Log "Set DefaultUserName to $currentUser"
-
-    Set-ItemProperty -Path $RegPath -Name "AutoAdminLogon" -Value "1" -Type String
-    Write-Log "Set AutoAdminLogon to 1"
-
-    if (Test-Path "$RegPath\DefaultPassword") {
-        Remove-ItemProperty -Path $RegPath -Name "DefaultPassword"
-        Write-Log "Removed DefaultPassword"
+    if ($Undo) {
+        Set-ItemProperty $reg AutoAdminLogon '0'
+        Say 'Autologin disabled. Set a password again: Ctrl+Alt+Del > Change a password.'
+        return
     }
 
-    if (Test-Path "$RegPath\AutoLogonCount") {
-        Remove-ItemProperty -Path $RegPath -Name "AutoLogonCount"
-        Write-Log "Removed AutoLogonCount"
-    }
+    # Logged-in user (console session), falls back to the user running the script
+    $user = (Get-CimInstance Win32_ComputerSystem).UserName
+    $user = if ($user) { $user.Split('\')[-1] } else { $env:USERNAME }
+    Say "User: $user"
 
-    Write-Log "Autologin successfully set for current user $currentUser."
+    # 1) Allow an empty password (min. length 0, no complexity)
+    $cfg = "$env:TEMP\secpol.cfg"; $db = "$env:TEMP\secpol.sdb"
+    secedit /export /cfg $cfg | Out-Null
+    (Get-Content $cfg) -replace 'MinimumPasswordLength = \d+', 'MinimumPasswordLength = 0' -replace 'PasswordComplexity = \d+', 'PasswordComplexity = 0' |
+        Set-Content $cfg
+    secedit /configure /db $db /cfg $cfg /areas SECURITYPOLICY | Out-Null
+    Remove-Item $cfg, $db -ErrorAction SilentlyContinue
+    Say 'Password policy: empty password allowed'
 
-    Write-Log "Disabling password policies"
-    secedit /export /cfg "C:\Windows\Temp\secpol.cfg"
-    (Get-Content "C:\Windows\Temp\secpol.cfg") -replace 'MinimumPasswordLength = \d+', 'MinimumPasswordLength = 0' | Set-Content "C:\Windows\Temp\secpol.cfg"
-    secedit /configure /db secedit.sdb /cfg "C:\Windows\Temp\secpol.cfg" /areas SECURITYPOLICY
-    Remove-Item "C:\Windows\Temp\secpol.cfg"
-    Write-Log "Minimum password length disabled"
+    # 2) Remove the user's password
+    ([ADSI]"WinNT://$env:COMPUTERNAME/$user,user").SetPassword('')
+    Say 'Password removed'
 
-    secedit /export /cfg "C:\Windows\Temp\secpol.cfg"
-    (Get-Content "C:\Windows\Temp\secpol.cfg") -replace 'PasswordComplexity = \d+', 'PasswordComplexity = 0' | Set-Content "C:\Windows\Temp\secpol.cfg"
-    secedit /configure /db secedit.sdb /cfg "C:\Windows\Temp\secpol.cfg" /areas SECURITYPOLICY
-    Remove-Item "C:\Windows\Temp\secpol.cfg"
-    Write-Log "Password complexity requirement disabled"
-
-    Write-Log "Removing user password"
-    net user $currentUser "" | Out-Null
-    Write-Log "User password removed"
-
-    Write-Log "Autologin script completed successfully."
-
-} catch {
-    Write-Log "An error occurred: $_"
-    throw $_
+    # 3) Autologin
+    Set-ItemProperty $reg DefaultUserName   $user
+    Set-ItemProperty $reg DefaultDomainName $env:COMPUTERNAME
+    Set-ItemProperty $reg AutoAdminLogon    '1'
+    Remove-ItemProperty $reg DefaultPassword, AutoLogonCount -ErrorAction SilentlyContinue
+    Say "Done. $user will be logged in automatically after restart."
+}
+catch {
+    Say "ERROR: $_"
+    exit 1
+}
+finally {
+    if ($Pause) { Read-Host 'Press Enter to close' | Out-Null }
 }
